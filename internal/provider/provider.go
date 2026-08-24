@@ -165,6 +165,7 @@ func (p *LiteLLMProvider) Resources(ctx context.Context) []func() resource.Resou
 		NewFallbackResource,
 		NewAgentResource,
 		NewProjectResource,
+		NewConfigResource,
 	}
 }
 
