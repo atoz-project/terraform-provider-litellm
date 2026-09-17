@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-09-18
+
+### Added
+- **`litellm_model`**: `additional_model_info` free-form `model_info` passthrough — arbitrary metadata LiteLLM stores alongside models without the provider filtering known keys. New in v2.2.0 (fork).
+- **`litellm_config`**: New resource for DB-backed `router_settings` (introduced in fork v2.1.0; carried into v2.2.0).
+
+### Verified
+- `go test ./...` passes.
+- Provider 2.2.0 assembles end-to-end: binary built (linux_amd64, ldflags `-X main.version=2.2.0`), installed to the filesystem mirror, consumer `terraform init` green, `.terraform.lock.hcl` refreshed to `version = "2.2.0"` + new `h1` hash.
+- ⚠ BLOCKED — `terraform plan` fails: `additional_model_info` is `schema.MapAttribute{ElementType: types.DynamicType}` (`internal/provider/resource_model.go:244`), i.e. `Map[Dynamic]`, which terraform-plugin-framework forbids; the provider schema fails to load on every plan regardless of config usage. Fix: declare the attribute as `schema.DynamicAttribute` (preserves the `{ key = value }` HCL object literal and native types); requires field `types.Map`→`types.Dynamic` + create/read/patch logic + the four `*_AdditionalModelInfo` tests. Pending before 2.2.0 is consumable.
+
 ## [2.0.1] - 2026-06-12
 
 ### Fixed
