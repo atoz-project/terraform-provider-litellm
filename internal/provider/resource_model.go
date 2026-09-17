@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -69,6 +70,7 @@ type ModelResourceModel struct {
 	VertexCredentials              types.String  `tfsdk:"vertex_credentials"`
 	AccessGroups                   types.List    `tfsdk:"access_groups"`
 	AdditionalLiteLLMParams        types.Map     `tfsdk:"additional_litellm_params"`
+	AdditionalModelInfo            types.Map     `tfsdk:"additional_model_info"`
 }
 
 func (r *ModelResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -234,6 +236,12 @@ func (r *ModelResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 				Optional:    true,
 				Computed:    true,
 				ElementType: types.StringType,
+			},
+			"additional_model_info": schema.MapAttribute{
+				Description: "Additional free-form key-value pairs merged into the model_info object sent to the LiteLLM API. Values retain their native types (boolean, number, string, list).",
+				Optional:    true,
+				Computed:    true,
+				ElementType: types.DynamicType,
 			},
 		},
 	}
@@ -495,6 +503,17 @@ func (r *ModelResource) createOrUpdateModel(ctx context.Context, data *ModelReso
 		}
 	}
 
+	// Add additional_model_info to the request.
+	// Unlike additional_litellm_params, values retain their native types
+	// (bool, number, array) and are sent as-is to the API.
+	if !data.AdditionalModelInfo.IsNull() && !data.AdditionalModelInfo.IsUnknown() {
+		for key, elem := range data.AdditionalModelInfo.Elements() {
+			if v := dynamicAttrToGo(ctx, elem); v != nil {
+				modelInfo[key] = v
+			}
+		}
+	}
+
 	modelReq := map[string]interface{}{
 		"model_name":     data.ModelName.ValueString(),
 		"litellm_params": litellmParams,
@@ -717,8 +736,57 @@ func (r *ModelResource) readModel(ctx context.Context, data *ModelResourceModel)
 		}
 		// If the API didn't return access_groups and we already have a concrete
 		// value (from config/state), leave it as-is.
-	} else if data.AccessGroups.IsUnknown() {
-		data.AccessGroups, _ = types.ListValue(types.StringType, []attr.Value{})
+
+		// Handle additional_model_info - preserve state when API omits custom keys.
+		knownModelInfoKeys := map[string]struct{}{
+			"id":                     {},
+			"db_model":               {},
+			"base_model":             {},
+			"tier":                   {},
+			"mode":                   {},
+			"team_id":                {},
+			"team_public_model_name": {},
+			"access_groups":          {},
+		}
+
+		// Build a set of keys the user configured in additional_model_info.
+		// During normal Read we only read back keys that exist in the prior state
+		// to avoid "new element appeared" errors when the API returns defaults
+		// that weren't in the config.  During Import (state is null/unknown) we
+		// read ALL non-known keys so the imported resource captures the full state.
+		filterMIByState := !data.AdditionalModelInfo.IsNull() && !data.AdditionalModelInfo.IsUnknown()
+		stateMIKeys := make(map[string]struct{})
+		if filterMIByState {
+			for k := range data.AdditionalModelInfo.Elements() {
+				stateMIKeys[k] = struct{}{}
+			}
+		}
+
+		additionalMI := make(map[string]attr.Value)
+		for key, rawValue := range modelInfo {
+			// Skip "known" model_info fields (handled by dedicated attributes)
+			// unless the user explicitly placed them in additional_model_info.
+			if _, isKnown := knownModelInfoKeys[key]; isKnown {
+				if _, inState := stateMIKeys[key]; !inState {
+					continue
+				}
+			}
+			// Only filter by state keys during normal Read (not Import).
+			if filterMIByState {
+				if _, inState := stateMIKeys[key]; !inState {
+					continue
+				}
+			}
+			if dv, ok := interfaceToDynamicValue(ctx, rawValue); ok {
+				additionalMI[key] = dv
+			}
+		}
+		data.AdditionalModelInfo, _ = types.MapValue(types.DynamicType, additionalMI)
+	} else {
+		if data.AccessGroups.IsUnknown() {
+			data.AccessGroups, _ = types.ListValue(types.StringType, []attr.Value{})
+		}
+		data.AdditionalModelInfo, _ = types.MapValue(types.DynamicType, map[string]attr.Value{})
 	}
 
 	// Ensure mode is never Unknown after a Read. Terraform requires all
@@ -742,6 +810,9 @@ func finalizeModelComputedDefaults(data *ModelResourceModel) {
 	}
 	if data.AdditionalLiteLLMParams.IsUnknown() {
 		data.AdditionalLiteLLMParams, _ = types.MapValue(types.StringType, map[string]attr.Value{})
+	}
+	if data.AdditionalModelInfo.IsUnknown() {
+		data.AdditionalModelInfo, _ = types.MapValue(types.DynamicType, map[string]attr.Value{})
 	}
 }
 
@@ -912,6 +983,15 @@ func (r *ModelResource) patchModel(ctx context.Context, data *ModelResourceModel
 		}
 	}
 
+	// Add additional_model_info to the request (same merge as createOrUpdateModel).
+	if !data.AdditionalModelInfo.IsNull() && !data.AdditionalModelInfo.IsUnknown() {
+		for key, elem := range data.AdditionalModelInfo.Elements() {
+			if v := dynamicAttrToGo(ctx, elem); v != nil {
+				modelInfo[key] = v
+			}
+		}
+	}
+
 	// Build the PATCH request body
 	patchReq := map[string]interface{}{
 		"model_name":     data.ModelName.ValueString(),
@@ -979,4 +1059,132 @@ func convertStringValue(s string) interface{} {
 		}
 	}
 	return s
+}
+
+// dynamicAttrToGo converts a types.Dynamic (or concrete attr.Value) to a Go
+// native type for JSON serialization to the LiteLLM API. Unlike
+// additional_litellm_params which stores strings and converts via
+// convertStringValue, this preserves native types (bool, number, array) so
+// the JSON reaching LiteLLM is not stringified.
+func dynamicAttrToGo(ctx context.Context, v attr.Value) interface{} {
+	if dv, ok := v.(types.Dynamic); ok {
+		v = dv.UnderlyingValue()
+		if v == nil {
+			return nil
+		}
+	}
+	if v.IsNull() || v.IsUnknown() {
+		return nil
+	}
+	switch concrete := v.(type) {
+	case types.Bool:
+		return concrete.ValueBool()
+	case types.String:
+		return concrete.ValueString()
+	case types.Int64:
+		return concrete.ValueInt64()
+	case types.Float64:
+		return concrete.ValueFloat64()
+	case types.Number:
+		bf := concrete.ValueBigFloat()
+		if bf.IsInt() {
+			i, _ := bf.Int64()
+			return i
+		}
+		f, _ := bf.Float64()
+		return f
+	case types.List:
+		result := make([]interface{}, 0, len(concrete.Elements()))
+		for _, elem := range concrete.Elements() {
+			result = append(result, dynamicAttrToGo(ctx, elem))
+		}
+		return result
+	case types.Set:
+		result := make([]interface{}, 0, len(concrete.Elements()))
+		for _, elem := range concrete.Elements() {
+			result = append(result, dynamicAttrToGo(ctx, elem))
+		}
+		return result
+	default:
+		return v
+	}
+}
+
+// interfaceToDynamicValue converts a Go interface{} (from JSON-decoded API
+// response) to a types.Dynamic attr.Value for storage in Terraform state.
+func interfaceToDynamicValue(ctx context.Context, v interface{}) (attr.Value, bool) {
+	switch val := v.(type) {
+	case bool:
+		return types.DynamicValue(types.BoolValue(val)), true
+	case string:
+		return types.DynamicValue(types.StringValue(val)), true
+	case float64:
+		return types.DynamicValue(types.NumberValue(big.NewFloat(val))), true
+	case int:
+		return types.DynamicValue(types.NumberValue(big.NewFloat(float64(val)))), true
+	case int64:
+		return types.DynamicValue(types.NumberValue(big.NewFloat(float64(val)))), true
+	case []interface{}:
+		return sliceToDynamicValue(ctx, val)
+	case map[string]interface{}:
+		return jsonFallback(v)
+	default:
+		return jsonFallback(v)
+	}
+}
+
+// sliceToDynamicValue creates a homogeneous types.List wrapped in
+// types.Dynamic from a []interface{}. Falls back to a JSON string when
+// element types are mixed or unsupported.
+func sliceToDynamicValue(ctx context.Context, vals []interface{}) (attr.Value, bool) {
+	if len(vals) == 0 {
+		lv, _ := types.ListValue(types.DynamicType, []attr.Value{})
+		return types.DynamicValue(lv), true
+	}
+	elems := make([]attr.Value, 0, len(vals))
+	var elemType attr.Type
+	for _, v := range vals {
+		ev, ok := interfaceToConcreteAttrValue(v)
+		if !ok {
+			return jsonFallback(vals)
+		}
+		if elemType == nil {
+			elemType = ev.Type(ctx)
+		} else if !ev.Type(ctx).Equal(elemType) {
+			return jsonFallback(vals)
+		}
+		elems = append(elems, ev)
+	}
+	lv, diags := types.ListValue(elemType, elems)
+	if diags.HasError() {
+		return jsonFallback(vals)
+	}
+	return types.DynamicValue(lv), true
+}
+
+// interfaceToConcreteAttrValue converts a Go primitive to a concrete
+// attr.Value (not wrapped in types.Dynamic).
+func interfaceToConcreteAttrValue(v interface{}) (attr.Value, bool) {
+	switch val := v.(type) {
+	case bool:
+		return types.BoolValue(val), true
+	case string:
+		return types.StringValue(val), true
+	case float64:
+		return types.NumberValue(big.NewFloat(val)), true
+	case int:
+		return types.NumberValue(big.NewFloat(float64(val))), true
+	case int64:
+		return types.NumberValue(big.NewFloat(float64(val))), true
+	default:
+		return nil, false
+	}
+}
+
+func jsonFallback(v interface{}) (attr.Value, bool) {
+	jsonBytes, err := json.Marshal(v)
+	if err != nil {
+		return nil, false
+	}
+	return types.DynamicValue(types.StringValue(string(jsonBytes))), true
 }

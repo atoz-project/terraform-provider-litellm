@@ -55,3 +55,23 @@ resource "litellm_model" "azure_with_drop_params" {
   input_cost_per_million_tokens  = 0.25
   output_cost_per_million_tokens = 2.00
 }
+
+# Example: using additional_model_info to pass capability flags and
+# deployment-level metadata into LiteLLM's model_info dict.
+# Unlike additional_litellm_params, values retain their native HCL types
+# (boolean, number, list) and are sent as native JSON to the API.
+resource "litellm_model" "with_additional_model_info" {
+  model_name          = "o3-mini-reasoning"
+  custom_llm_provider = "openai"
+  model_api_key       = var.openai_api_key
+  base_model          = "o3-mini"
+  mode                = "chat"
+
+  # Additional model_info keys not exposed as first-class arguments.
+  # Values are native types — bool stays bool, not string "false".
+  additional_model_info = {
+    supports_max_reasoning_effort = false
+    reasoning_effort_levels       = ["low", "medium", "high"]
+    max_retries                   = 3
+  }
+}

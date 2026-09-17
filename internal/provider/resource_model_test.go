@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -1008,5 +1009,305 @@ func TestReadModelImportReadsAllAdditionalParams(t *testing.T) {
 	}
 	if _, ok := additional["custom_flag"]; !ok {
 		t.Fatal("custom_flag missing after import")
+	}
+}
+
+// TestCreateModelSendsAdditionalModelInfo verifies that additional_model_info
+// values of mixed types (bool, []string, number) are sent to the LiteLLM API
+// as native JSON types, not stringified.
+func TestCreateModelSendsAdditionalModelInfo(t *testing.T) {
+	t.Parallel()
+
+	var capturedBody map[string]interface{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	r := &ModelResource{
+		client: &Client{
+			APIBase:    server.URL,
+			APIKey:     "test-key",
+			HTTPClient: server.Client(),
+		},
+	}
+
+	// Build additional_model_info with bool, []string, and number — the three
+	// types that must reach the API as native JSON (not stringified).
+	reasoningLevels, _ := types.ListValue(types.StringType, []attr.Value{
+		types.StringValue("low"), types.StringValue("medium"), types.StringValue("high"),
+	})
+	additionalMI, _ := types.MapValue(types.DynamicType, map[string]attr.Value{
+		"supports_max_reasoning_effort": types.DynamicValue(types.BoolValue(false)),
+		"reasoning_effort_levels":      types.DynamicValue(reasoningLevels),
+		"max_retries":                  types.DynamicValue(types.NumberValue(big.NewFloat(3))),
+	})
+
+	data := &ModelResourceModel{
+		ModelName:           types.StringValue("test-model"),
+		CustomLLMProvider:   types.StringValue("openai"),
+		BaseModel:           types.StringValue("gpt-4o-mini"),
+		Tier:                types.StringNull(),
+		Mode:                types.StringNull(),
+		AdditionalModelInfo: additionalMI,
+		AccessGroups:        types.ListNull(types.StringType),
+	}
+
+	err := r.createOrUpdateModel(context.Background(), data, "test-id", false)
+	if err != nil {
+		t.Fatalf("createOrUpdateModel returned error: %v", err)
+	}
+
+	modelInfo, ok := capturedBody["model_info"].(map[string]interface{})
+	if !ok {
+		t.Fatal("model_info not found in request body")
+	}
+
+	// bool must be native false, not string "false"
+	if v, ok := modelInfo["supports_max_reasoning_effort"]; !ok {
+		t.Fatal("supports_max_reasoning_effort not found in model_info")
+	} else if v != false {
+		t.Fatalf("expected supports_max_reasoning_effort=false (bool), got %v (%T)", v, v)
+	}
+
+	// []string must be a native JSON array, not a JSON string
+	if v, ok := modelInfo["reasoning_effort_levels"].([]interface{}); !ok {
+		t.Fatalf("expected reasoning_effort_levels to be []interface{}, got %T", modelInfo["reasoning_effort_levels"])
+	} else if len(v) != 3 || v[0] != "low" || v[2] != "high" {
+		t.Fatalf("expected reasoning_effort_levels=[low,medium,high], got %v", v)
+	}
+
+	// number must be native JSON number, not string "3"
+	if v, ok := modelInfo["max_retries"]; !ok {
+		t.Fatal("max_retries not found in model_info")
+	} else if v != float64(3) {
+		t.Fatalf("expected max_retries=3 (number), got %v (%T)", v, v)
+	}
+}
+
+// TestPatchModelSendsAdditionalModelInfo verifies the PATCH path also
+// merges additional_model_info into model_info as native types.
+func TestPatchModelSendsAdditionalModelInfo(t *testing.T) {
+	t.Parallel()
+
+	var capturedBody map[string]interface{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PATCH" {
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	r := &ModelResource{
+		client: &Client{
+			APIBase:    server.URL,
+			APIKey:     "test-key",
+			HTTPClient: server.Client(),
+		},
+	}
+
+	additionalMI, _ := types.MapValue(types.DynamicType, map[string]attr.Value{
+		"supports_max_reasoning_effort": types.DynamicValue(types.BoolValue(true)),
+		"max_retries":                  types.DynamicValue(types.NumberValue(big.NewFloat(5))),
+	})
+
+	data := &ModelResourceModel{
+		ID:                  types.StringValue("model-789"),
+		ModelName:           types.StringValue("test-model"),
+		CustomLLMProvider:   types.StringValue("openai"),
+		BaseModel:           types.StringValue("gpt-4o-mini"),
+		Tier:                types.StringNull(),
+		Mode:                types.StringNull(),
+		AdditionalModelInfo: additionalMI,
+		AccessGroups:        types.ListNull(types.StringType),
+	}
+
+	err := r.patchModel(context.Background(), data)
+	if err != nil {
+		t.Fatalf("patchModel returned error: %v", err)
+	}
+
+	modelInfo, ok := capturedBody["model_info"].(map[string]interface{})
+	if !ok {
+		t.Fatal("model_info not found in request body")
+	}
+
+	if v := modelInfo["supports_max_reasoning_effort"]; v != true {
+		t.Fatalf("expected supports_max_reasoning_effort=true (bool), got %v (%T)", v, v)
+	}
+	if v := modelInfo["max_retries"]; v != float64(5) {
+		t.Fatalf("expected max_retries=5 (number), got %v (%T)", v, v)
+	}
+}
+
+// TestReadModelExtractsAdditionalModelInfo verifies that readModel reads
+// additional_model_info keys from the API response as native types.
+func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []interface{}{
+				map[string]interface{}{
+					"model_name": "test-model",
+					"litellm_params": map[string]interface{}{
+						"custom_llm_provider": "openai",
+						"model":               "openai/test-model",
+					},
+					"model_info": map[string]interface{}{
+						"base_model":                 "test-model",
+						"supports_max_reasoning_effort": false,
+						"reasoning_effort_levels":      []interface{}{"low", "medium", "high"},
+						"max_retries":                 3,
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	r := &ModelResource{
+		client: &Client{
+			APIBase:    server.URL,
+			APIKey:     "test-key",
+			HTTPClient: server.Client(),
+		},
+	}
+
+	// Simulate state with keys the user configured — readModel only reads
+	// back keys that already exist in state.
+	priorMI, _ := types.MapValue(types.DynamicType, map[string]attr.Value{
+		"supports_max_reasoning_effort": types.DynamicValue(types.BoolNull()),
+		"reasoning_effort_levels":       types.DynamicValue(types.StringNull()),
+		"max_retries":                   types.DynamicValue(types.NumberNull()),
+	})
+
+	data := ModelResourceModel{
+		ID:                  types.StringValue("model-456"),
+		AccessGroups:        types.ListUnknown(types.StringType),
+		AdditionalModelInfo: priorMI,
+	}
+
+	if err := r.readModel(context.Background(), &data); err != nil {
+		t.Fatalf("readModel returned error: %v", err)
+	}
+
+	// Verify additional_model_info was populated with native-type values
+	elements := data.AdditionalModelInfo.Elements()
+
+	// bool → types.Bool
+	if dv, ok := elements["supports_max_reasoning_effort"].(types.Dynamic); ok {
+		if bv, ok := dv.UnderlyingValue().(types.Bool); ok {
+			if bv.ValueBool() != false {
+				t.Fatalf("expected supports_max_reasoning_effort=false, got %v", bv.ValueBool())
+			}
+		} else {
+			t.Fatalf("expected types.Bool, got %T", dv.UnderlyingValue())
+		}
+	} else {
+		t.Fatal("supports_max_reasoning_effort missing from additional_model_info")
+	}
+
+	// []string → types.List
+	if dv, ok := elements["reasoning_effort_levels"].(types.Dynamic); ok {
+		if lv, ok := dv.UnderlyingValue().(types.List); ok {
+			if len(lv.Elements()) != 3 {
+				t.Fatalf("expected 3 elements, got %d", len(lv.Elements()))
+			}
+			if sv, ok := lv.Elements()[0].(types.String); ok {
+				if sv.ValueString() != "low" {
+					t.Fatalf("expected first element 'low', got %q", sv.ValueString())
+				}
+			} else {
+				t.Fatalf("expected types.String element, got %T", lv.Elements()[0])
+			}
+		} else {
+			t.Fatalf("expected types.List, got %T", dv.UnderlyingValue())
+		}
+	} else {
+		t.Fatal("reasoning_effort_levels missing from additional_model_info")
+	}
+
+	// number → types.Number
+	if dv, ok := elements["max_retries"].(types.Dynamic); ok {
+		if nv, ok := dv.UnderlyingValue().(types.Number); ok {
+			bf := nv.ValueBigFloat()
+			if i, acc := bf.Int64(); i != 3 || acc != big.Exact {
+				t.Fatalf("expected max_retries=3, got %v (acc=%v)", i, acc)
+			}
+		} else {
+			t.Fatalf("expected types.Number, got %T", dv.UnderlyingValue())
+		}
+	} else {
+		t.Fatal("max_retries missing from additional_model_info")
+	}
+}
+
+// TestReadModelImportReadsAllAdditionalModelInfo verifies that during Import
+// (state is unknown), readModel reads ALL non-known model_info keys.
+func TestReadModelImportReadsAllAdditionalModelInfo(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []interface{}{
+				map[string]interface{}{
+					"model_name": "test-model",
+					"litellm_params": map[string]interface{}{
+						"custom_llm_provider": "openai",
+						"model":               "openai/test-model",
+					},
+					"model_info": map[string]interface{}{
+						"base_model":                    "test-model",
+						"supports_max_reasoning_effort": true,
+						"max_retries":                   7,
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	r := &ModelResource{
+		client: &Client{
+			APIBase:    server.URL,
+			APIKey:     "test-key",
+			HTTPClient: server.Client(),
+		},
+	}
+
+	// Simulate Import: additional_model_info is Unknown
+	data := ModelResourceModel{
+		ID:                  types.StringValue("import-id"),
+		AccessGroups:        types.ListUnknown(types.StringType),
+		AdditionalModelInfo: types.MapUnknown(types.DynamicType),
+	}
+
+	if err := r.readModel(context.Background(), &data); err != nil {
+		t.Fatalf("readModel returned error: %v", err)
+	}
+
+	elements := data.AdditionalModelInfo.Elements()
+	if _, ok := elements["supports_max_reasoning_effort"]; !ok {
+		t.Fatal("supports_max_reasoning_effort missing after import")
+	}
+	if _, ok := elements["max_retries"]; !ok {
+		t.Fatal("max_retries missing after import")
 	}
 }

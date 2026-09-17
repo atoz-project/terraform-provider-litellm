@@ -264,6 +264,33 @@ The following arguments are supported:
   }
   ```
 
+* `additional_model_info` - (Optional) map(any). A map of free-form key-value pairs merged into the `model_info` object sent to the LiteLLM API. Unlike `additional_litellm_params`, values retain their native HCL types (boolean, number, string, list) and are sent as native JSON — a `false` boolean stays `false`, not the string `"false"`. This is intended for capability flags and deployment-level metadata that LiteLLM stores in `model_info`.
+
+  Behavior rules:
+  * Values retain their native types: booleans, numbers, strings, and lists are serialized as native JSON (not stringified).
+  * The provider merges these keys into the `model_info` payload sent to the API.
+  * During normal reads, only keys already present in configuration/state are read back (avoids drift from API-injected defaults). During import, all non-known `model_info` keys are read.
+  * Keys handled by dedicated attributes (`base_model`, `tier`, `mode`, `team_id`, `access_groups`) are skipped unless explicitly placed in `additional_model_info`.
+  * **Limitation: keys cannot be deleted via update.** Same merge semantics as `additional_litellm_params` — the LiteLLM PATCH API merges, it does not replace. Recreate the resource to fully remove a key.
+
+  Example showing boolean, list, and number:
+
+  ```hcl
+  resource "litellm_model" "reasoning" {
+    model_name          = "o3-mini-reasoning"
+    custom_llm_provider = "openai"
+    model_api_key       = var.openai_api_key
+    base_model          = "o3-mini"
+    mode                = "chat"
+
+    additional_model_info = {
+      supports_max_reasoning_effort = false
+      reasoning_effort_levels       = ["low", "medium", "high"]
+      max_retries                   = 3
+    }
+  }
+  ```
+
 ### AWS-specific Configuration
 
 * `aws_access_key_id` - (Optional) string (Sensitive). AWS access key ID for AWS-based models.
