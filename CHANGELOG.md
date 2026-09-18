@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`litellm_model`**: `additional_model_info` free-form `model_info` passthrough — arbitrary metadata LiteLLM stores alongside models without the provider filtering known keys. New in v2.2.0 (fork).
 - **`litellm_config`**: New resource for DB-backed `router_settings` (introduced in fork v2.1.0; carried into v2.2.0).
 
+### Fixed
+- **`litellm_model`**: Array values in `additional_model_info` no longer serialize as `{}` — HCL arrays in a `DynamicAttribute` decode to `types.Tuple`, which the write path now converts alongside List/Set. Read-back arrays are built as Tuples (matching the config decode shape; cty Tuple != List), fixing the apply-time `tuple required but have string` error and the permanent diff it implied.
+
 ### Verified
 - `go test ./...` passes.
 - Provider 2.2.0 assembles end-to-end: binary built (linux_amd64, ldflags `-X main.version=2.2.0`), installed to the filesystem mirror, consumer `terraform init` green, `.terraform.lock.hcl` refreshed to `version = "2.2.0"` + new `h1` hash.

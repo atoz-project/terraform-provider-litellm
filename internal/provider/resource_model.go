@@ -782,7 +782,7 @@ func (r *ModelResource) readModel(ctx context.Context, data *ModelResourceModel)
 				}
 			}
 			if dv, ok := interfaceToDynamicValue(ctx, rawValue); ok {
-				// Store concrete values (Bool/Number/List/...) as object
+				// Store concrete values (Bool/Number/Tuple/...) as object
 				// attributes, not Dynamic wrappers, so each key keeps a
 				// stable type across plan/read.
 				additionalMI[key] = dv.(types.Dynamic).UnderlyingValue()
@@ -1141,6 +1141,15 @@ func dynamicAttrToGo(ctx context.Context, v attr.Value) interface{} {
 			result = append(result, dynamicAttrToGo(ctx, elem))
 		}
 		return result
+	case types.Tuple:
+		// HCL tuple literals in a DynamicAttribute decode to TupleValue (not
+		// ListValue); without this case they fell through to default and
+		// json.Marshal(TupleValue) produced {} (all fields unexported).
+		result := make([]interface{}, 0, len(concrete.Elements()))
+		for _, elem := range concrete.Elements() {
+			result = append(result, dynamicAttrToGo(ctx, elem))
+		}
+		return result
 	case types.Set:
 		result := make([]interface{}, 0, len(concrete.Elements()))
 		for _, elem := range concrete.Elements() {
@@ -1175,33 +1184,27 @@ func interfaceToDynamicValue(ctx context.Context, v interface{}) (attr.Value, bo
 	}
 }
 
-// sliceToDynamicValue creates a homogeneous types.List wrapped in
-// types.Dynamic from a []interface{}. Falls back to a JSON string when
-// element types are mixed or unsupported.
+// sliceToDynamicValue wraps a JSON-decoded []interface{} in types.Dynamic as
+// a types.Tuple (per-element types), not a types.List. Config-side arrays in
+// a DynamicAttribute decode to TupleValue, and cty Tuple != List, so a List
+// here would cause a permanent type-mismatch diff after apply. Tuple also
+// carries heterogeneous element types natively, so no homogeneity fallback.
 func sliceToDynamicValue(ctx context.Context, vals []interface{}) (attr.Value, bool) {
-	if len(vals) == 0 {
-		lv, _ := types.ListValue(types.DynamicType, []attr.Value{})
-		return types.DynamicValue(lv), true
-	}
 	elems := make([]attr.Value, 0, len(vals))
-	var elemType attr.Type
+	elemTypes := make([]attr.Type, 0, len(vals))
 	for _, v := range vals {
 		ev, ok := interfaceToConcreteAttrValue(v)
 		if !ok {
 			return jsonFallback(vals)
 		}
-		if elemType == nil {
-			elemType = ev.Type(ctx)
-		} else if !ev.Type(ctx).Equal(elemType) {
-			return jsonFallback(vals)
-		}
 		elems = append(elems, ev)
+		elemTypes = append(elemTypes, ev.Type(ctx))
 	}
-	lv, diags := types.ListValue(elemType, elems)
+	tv, diags := types.TupleValue(elemTypes, elems)
 	if diags.HasError() {
 		return jsonFallback(vals)
 	}
-	return types.DynamicValue(lv), true
+	return types.DynamicValue(tv), true
 }
 
 // interfaceToConcreteAttrValue converts a Go primitive to a concrete

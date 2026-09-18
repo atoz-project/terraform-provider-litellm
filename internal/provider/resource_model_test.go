@@ -1157,6 +1157,77 @@ func TestPatchModelSendsAdditionalModelInfo(t *testing.T) {
 	}
 }
 
+// TestAdditionalModelInfoToGoTuple is the regression repro for the production bug:
+// an HCL array literal in a DynamicAttribute decodes to types.Tuple (not
+// types.List). The pre-fix dynamicAttrToGo had no Tuple case, so
+// json.Marshal(TupleValue) — all fields unexported — stored {} server-side.
+func TestAdditionalModelInfoToGoTuple(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	tuple := types.TupleValueMust(
+		[]attr.Type{types.StringType, types.StringType, types.StringType},
+		[]attr.Value{types.StringValue("low"), types.StringValue("high"), types.StringValue("max")},
+	)
+	mi := additionalModelInfoToGo(ctx, dynamicObjectValue(ctx, map[string]attr.Value{
+		"reasoning_effort_levels": tuple,
+		"supports_reasoning":      types.BoolValue(true),
+	}))
+
+	raw, err := json.Marshal(mi)
+	if err != nil {
+		t.Fatalf("json.Marshal returned error: %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
+	}
+
+	levels, ok := decoded["reasoning_effort_levels"].([]interface{})
+	if !ok {
+		t.Fatalf("expected reasoning_effort_levels to survive as a JSON array, got %v (%T) in %s",
+			decoded["reasoning_effort_levels"], decoded["reasoning_effort_levels"], raw)
+	}
+	if len(levels) != 3 || levels[0] != "low" || levels[1] != "high" || levels[2] != "max" {
+		t.Fatalf("expected [low high max], got %v", levels)
+	}
+	if decoded["supports_reasoning"] != true {
+		t.Fatalf("expected supports_reasoning=true, got %v", decoded["supports_reasoning"])
+	}
+}
+
+// TestSliceToDynamicValueMatchesConfigTupleShape asserts read-back arrays are
+// Tuples whose cty type equals the config decode shape — heterogeneous
+// included (previously fell back to a JSON string, breaking apply with
+// "tuple required but have string").
+func TestSliceToDynamicValueMatchesConfigTupleShape(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	dv, ok := interfaceToDynamicValue(ctx, []interface{}{"low", "high", "max"})
+	if !ok {
+		t.Fatal("interfaceToDynamicValue returned !ok")
+	}
+	configShape := types.TupleType{ElemTypes: []attr.Type{types.StringType, types.StringType, types.StringType}}
+	if got := dv.(types.Dynamic).UnderlyingValue().Type(ctx); !got.Equal(configShape) {
+		t.Fatalf("read-back type %v does not match config decode shape %v", got, configShape)
+	}
+
+	// Heterogeneous arrays stay a Tuple instead of degrading to a JSON string.
+	dvMixed, ok := interfaceToDynamicValue(ctx, []interface{}{"a", float64(1), true})
+	if !ok {
+		t.Fatal("interfaceToDynamicValue returned !ok for mixed slice")
+	}
+	mixed, ok := dvMixed.(types.Dynamic).UnderlyingValue().(types.Tuple)
+	if !ok {
+		t.Fatalf("expected heterogeneous slice to stay types.Tuple, got %T", dvMixed.(types.Dynamic).UnderlyingValue())
+	}
+	if len(mixed.Elements()) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(mixed.Elements()))
+	}
+}
+
 // TestReadModelExtractsAdditionalModelInfo verifies that readModel reads
 // additional_model_info keys from the API response as native types.
 func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
@@ -1196,7 +1267,7 @@ func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
 	// back keys that already exist in state.
 	priorMI := dynamicObjectValue(context.Background(), map[string]attr.Value{
 		"supports_max_reasoning_effort": types.BoolNull(),
-		"reasoning_effort_levels":       types.ListNull(types.StringType),
+		"reasoning_effort_levels":       types.TupleNull([]attr.Type{types.StringType, types.StringType, types.StringType}),
 		"max_retries":                   types.NumberNull(),
 	})
 
@@ -1226,20 +1297,25 @@ func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
 		t.Fatalf("supports_max_reasoning_effort missing or wrong type: %T", elements["supports_max_reasoning_effort"])
 	}
 
-	// []string → types.List
-	if lv, ok := elements["reasoning_effort_levels"].(types.List); ok {
-		if len(lv.Elements()) != 3 {
-			t.Fatalf("expected 3 elements, got %d", len(lv.Elements()))
-		}
-		if sv, ok := lv.Elements()[0].(types.String); ok {
-			if sv.ValueString() != "low" {
-				t.Fatalf("expected first element 'low', got %q", sv.ValueString())
-			}
-		} else {
-			t.Fatalf("expected types.String element, got %T", lv.Elements()[0])
+	// []string → types.Tuple (same cty shape a config array decodes to;
+	// cty Tuple != List, so a List here would cause a permanent diff)
+	tv, ok := elements["reasoning_effort_levels"].(types.Tuple)
+	if !ok {
+		t.Fatalf("reasoning_effort_levels missing or wrong type: %T", elements["reasoning_effort_levels"])
+	}
+	configShape := types.TupleType{ElemTypes: []attr.Type{types.StringType, types.StringType, types.StringType}}
+	if !tv.Type(context.Background()).Equal(configShape) {
+		t.Fatalf("expected tuple type %v (config decode shape), got %v", configShape, tv.Type(context.Background()))
+	}
+	if len(tv.Elements()) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(tv.Elements()))
+	}
+	if sv, ok := tv.Elements()[0].(types.String); ok {
+		if sv.ValueString() != "low" {
+			t.Fatalf("expected first element 'low', got %q", sv.ValueString())
 		}
 	} else {
-		t.Fatalf("reasoning_effort_levels missing or wrong type: %T", elements["reasoning_effort_levels"])
+		t.Fatalf("expected types.String element, got %T", tv.Elements()[0])
 	}
 
 	// number → types.Number
