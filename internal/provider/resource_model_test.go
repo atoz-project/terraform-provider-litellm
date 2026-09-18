@@ -9,7 +9,10 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
 func TestReadModelResolvesUnknownOptionalComputedCollections(t *testing.T) {
@@ -431,7 +434,7 @@ func TestPatchModelSendsTeamPublicModelNameWhenTeamIDSet(t *testing.T) {
 		TeamID:            types.StringValue(wantTeamID),
 		Tier:              types.StringNull(),
 		Mode:              types.StringNull(),
-		AccessGroups:     types.ListNull(types.StringType),
+		AccessGroups:      types.ListNull(types.StringType),
 	}
 
 	err := r.patchModel(context.Background(), data)
@@ -1045,10 +1048,10 @@ func TestCreateModelSendsAdditionalModelInfo(t *testing.T) {
 	reasoningLevels, _ := types.ListValue(types.StringType, []attr.Value{
 		types.StringValue("low"), types.StringValue("medium"), types.StringValue("high"),
 	})
-	additionalMI, _ := types.MapValue(types.DynamicType, map[string]attr.Value{
-		"supports_max_reasoning_effort": types.DynamicValue(types.BoolValue(false)),
-		"reasoning_effort_levels":      types.DynamicValue(reasoningLevels),
-		"max_retries":                  types.DynamicValue(types.NumberValue(big.NewFloat(3))),
+	additionalMI := dynamicObjectValue(context.Background(), map[string]attr.Value{
+		"supports_max_reasoning_effort": types.BoolValue(false),
+		"reasoning_effort_levels":       reasoningLevels,
+		"max_retries":                   types.NumberValue(big.NewFloat(3)),
 	})
 
 	data := &ModelResourceModel{
@@ -1120,9 +1123,9 @@ func TestPatchModelSendsAdditionalModelInfo(t *testing.T) {
 		},
 	}
 
-	additionalMI, _ := types.MapValue(types.DynamicType, map[string]attr.Value{
-		"supports_max_reasoning_effort": types.DynamicValue(types.BoolValue(true)),
-		"max_retries":                  types.DynamicValue(types.NumberValue(big.NewFloat(5))),
+	additionalMI := dynamicObjectValue(context.Background(), map[string]attr.Value{
+		"supports_max_reasoning_effort": types.BoolValue(true),
+		"max_retries":                   types.NumberValue(big.NewFloat(5)),
 	})
 
 	data := &ModelResourceModel{
@@ -1170,10 +1173,10 @@ func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
 						"model":               "openai/test-model",
 					},
 					"model_info": map[string]interface{}{
-						"base_model":                 "test-model",
+						"base_model":                    "test-model",
 						"supports_max_reasoning_effort": false,
-						"reasoning_effort_levels":      []interface{}{"low", "medium", "high"},
-						"max_retries":                 3,
+						"reasoning_effort_levels":       []interface{}{"low", "medium", "high"},
+						"max_retries":                   3,
 					},
 				},
 			},
@@ -1191,10 +1194,10 @@ func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
 
 	// Simulate state with keys the user configured — readModel only reads
 	// back keys that already exist in state.
-	priorMI, _ := types.MapValue(types.DynamicType, map[string]attr.Value{
-		"supports_max_reasoning_effort": types.DynamicValue(types.BoolNull()),
-		"reasoning_effort_levels":       types.DynamicValue(types.StringNull()),
-		"max_retries":                   types.DynamicValue(types.NumberNull()),
+	priorMI := dynamicObjectValue(context.Background(), map[string]attr.Value{
+		"supports_max_reasoning_effort": types.BoolNull(),
+		"reasoning_effort_levels":       types.ListNull(types.StringType),
+		"max_retries":                   types.NumberNull(),
 	})
 
 	data := ModelResourceModel{
@@ -1208,53 +1211,45 @@ func TestReadModelExtractsAdditionalModelInfo(t *testing.T) {
 	}
 
 	// Verify additional_model_info was populated with native-type values
-	elements := data.AdditionalModelInfo.Elements()
+	obj, ok := data.AdditionalModelInfo.UnderlyingValue().(types.Object)
+	if !ok {
+		t.Fatalf("expected additional_model_info to be an object, got %T", data.AdditionalModelInfo.UnderlyingValue())
+	}
+	elements := obj.Attributes()
 
 	// bool → types.Bool
-	if dv, ok := elements["supports_max_reasoning_effort"].(types.Dynamic); ok {
-		if bv, ok := dv.UnderlyingValue().(types.Bool); ok {
-			if bv.ValueBool() != false {
-				t.Fatalf("expected supports_max_reasoning_effort=false, got %v", bv.ValueBool())
-			}
-		} else {
-			t.Fatalf("expected types.Bool, got %T", dv.UnderlyingValue())
+	if bv, ok := elements["supports_max_reasoning_effort"].(types.Bool); ok {
+		if bv.ValueBool() != false {
+			t.Fatalf("expected supports_max_reasoning_effort=false, got %v", bv.ValueBool())
 		}
 	} else {
-		t.Fatal("supports_max_reasoning_effort missing from additional_model_info")
+		t.Fatalf("supports_max_reasoning_effort missing or wrong type: %T", elements["supports_max_reasoning_effort"])
 	}
 
 	// []string → types.List
-	if dv, ok := elements["reasoning_effort_levels"].(types.Dynamic); ok {
-		if lv, ok := dv.UnderlyingValue().(types.List); ok {
-			if len(lv.Elements()) != 3 {
-				t.Fatalf("expected 3 elements, got %d", len(lv.Elements()))
-			}
-			if sv, ok := lv.Elements()[0].(types.String); ok {
-				if sv.ValueString() != "low" {
-					t.Fatalf("expected first element 'low', got %q", sv.ValueString())
-				}
-			} else {
-				t.Fatalf("expected types.String element, got %T", lv.Elements()[0])
+	if lv, ok := elements["reasoning_effort_levels"].(types.List); ok {
+		if len(lv.Elements()) != 3 {
+			t.Fatalf("expected 3 elements, got %d", len(lv.Elements()))
+		}
+		if sv, ok := lv.Elements()[0].(types.String); ok {
+			if sv.ValueString() != "low" {
+				t.Fatalf("expected first element 'low', got %q", sv.ValueString())
 			}
 		} else {
-			t.Fatalf("expected types.List, got %T", dv.UnderlyingValue())
+			t.Fatalf("expected types.String element, got %T", lv.Elements()[0])
 		}
 	} else {
-		t.Fatal("reasoning_effort_levels missing from additional_model_info")
+		t.Fatalf("reasoning_effort_levels missing or wrong type: %T", elements["reasoning_effort_levels"])
 	}
 
 	// number → types.Number
-	if dv, ok := elements["max_retries"].(types.Dynamic); ok {
-		if nv, ok := dv.UnderlyingValue().(types.Number); ok {
-			bf := nv.ValueBigFloat()
-			if i, acc := bf.Int64(); i != 3 || acc != big.Exact {
-				t.Fatalf("expected max_retries=3, got %v (acc=%v)", i, acc)
-			}
-		} else {
-			t.Fatalf("expected types.Number, got %T", dv.UnderlyingValue())
+	if nv, ok := elements["max_retries"].(types.Number); ok {
+		bf := nv.ValueBigFloat()
+		if i, acc := bf.Int64(); i != 3 || acc != big.Exact {
+			t.Fatalf("expected max_retries=3, got %v (acc=%v)", i, acc)
 		}
 	} else {
-		t.Fatal("max_retries missing from additional_model_info")
+		t.Fatalf("max_retries missing or wrong type: %T", elements["max_retries"])
 	}
 }
 
@@ -1296,18 +1291,68 @@ func TestReadModelImportReadsAllAdditionalModelInfo(t *testing.T) {
 	data := ModelResourceModel{
 		ID:                  types.StringValue("import-id"),
 		AccessGroups:        types.ListUnknown(types.StringType),
-		AdditionalModelInfo: types.MapUnknown(types.DynamicType),
+		AdditionalModelInfo: types.DynamicUnknown(),
 	}
 
 	if err := r.readModel(context.Background(), &data); err != nil {
 		t.Fatalf("readModel returned error: %v", err)
 	}
 
-	elements := data.AdditionalModelInfo.Elements()
+	obj, ok := data.AdditionalModelInfo.UnderlyingValue().(types.Object)
+	if !ok {
+		t.Fatalf("expected additional_model_info to be an object, got %T", data.AdditionalModelInfo.UnderlyingValue())
+	}
+	elements := obj.Attributes()
 	if _, ok := elements["supports_max_reasoning_effort"]; !ok {
 		t.Fatal("supports_max_reasoning_effort missing after import")
 	}
 	if _, ok := elements["max_retries"]; !ok {
 		t.Fatal("max_retries missing after import")
+	}
+}
+
+// TestProviderSchemaImplementationValid runs the framework's real
+// GetProviderSchema generation path and asserts no "Invalid Schema
+// Implementation" diagnostics. Unit tests never trigger the framework's
+// schema validation (it only runs when Terraform core pulls the provider
+// schema), which is how the Map[Dynamic] additional_model_info definition
+// shipped green while every `terraform plan` failed. This test is the gate.
+func TestProviderSchemaImplementationValid(t *testing.T) {
+	t.Parallel()
+
+	serverFactory, err := providerserver.NewProtocol6WithError(New("test")())()
+	if err != nil {
+		t.Fatalf("failed to create protocol6 server: %v", err)
+	}
+
+	resp, err := serverFactory.GetProviderSchema(context.Background(), &tfprotov6.GetProviderSchemaRequest{})
+	if err != nil {
+		t.Fatalf("GetProviderSchema returned error: %v", err)
+	}
+	for _, d := range resp.Diagnostics {
+		if d.Severity == tfprotov6.DiagnosticSeverityError {
+			t.Fatalf("schema diagnostic error: %s: %s (attribute: %s)", d.Summary, d.Detail, d.Attribute)
+		}
+	}
+
+	// additional_model_info must be a top-level dynamic attribute (an object
+	// value carried by DynamicPseudoType), not a collection with nested
+	// dynamic elements.
+	modelSchema, ok := resp.ResourceSchemas["litellm_model"]
+	if !ok {
+		t.Fatal("litellm_model resource schema missing from GetProviderSchema response")
+	}
+	var ami *tfprotov6.SchemaAttribute
+	for _, a := range modelSchema.Block.Attributes {
+		if a.Name == "additional_model_info" {
+			ami = a
+			break
+		}
+	}
+	if ami == nil {
+		t.Fatal("additional_model_info attribute missing from litellm_model schema")
+	}
+	if !ami.Type.Is(tftypes.DynamicPseudoType) {
+		t.Fatalf("expected additional_model_info to be DynamicPseudoType, got %s", ami.Type.String())
 	}
 }

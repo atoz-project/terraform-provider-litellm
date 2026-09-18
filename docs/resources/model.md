@@ -264,7 +264,7 @@ The following arguments are supported:
   }
   ```
 
-* `additional_model_info` - (Optional) map(any). A map of free-form key-value pairs merged into the `model_info` object sent to the LiteLLM API. Unlike `additional_litellm_params`, values retain their native HCL types (boolean, number, string, list) and are sent as native JSON — a `false` boolean stays `false`, not the string `"false"`. This is intended for capability flags and deployment-level metadata that LiteLLM stores in `model_info`.
+* `additional_model_info` - (Optional) dynamic. An object of free-form key-value pairs (`{ key = value, ... }`) merged into the `model_info` object sent to the LiteLLM API. Unlike `additional_litellm_params`, values retain their native HCL types (boolean, number, string, list) and are sent as native JSON — a `false` boolean stays `false`, not the string `"false"`. This is intended for capability flags and deployment-level metadata that LiteLLM stores in `model_info`.
 
   Behavior rules:
   * Values retain their native types: booleans, numbers, strings, and lists are serialized as native JSON (not stringified).

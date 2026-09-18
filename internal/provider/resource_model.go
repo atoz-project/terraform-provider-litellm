@@ -70,7 +70,7 @@ type ModelResourceModel struct {
 	VertexCredentials              types.String  `tfsdk:"vertex_credentials"`
 	AccessGroups                   types.List    `tfsdk:"access_groups"`
 	AdditionalLiteLLMParams        types.Map     `tfsdk:"additional_litellm_params"`
-	AdditionalModelInfo            types.Map     `tfsdk:"additional_model_info"`
+	AdditionalModelInfo            types.Dynamic `tfsdk:"additional_model_info"`
 }
 
 func (r *ModelResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -237,11 +237,15 @@ func (r *ModelResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 				Computed:    true,
 				ElementType: types.StringType,
 			},
-			"additional_model_info": schema.MapAttribute{
+			// DynamicAttribute instead of MapAttribute{ElementType: DynamicType}:
+			// the framework forbids dynamic types inside collections, and the
+			// HCL usage `additional_model_info = { key = value }` is an object
+			// either way, so a single dynamic value preserves both the
+			// arbitrary-key semantics and native value types.
+			"additional_model_info": schema.DynamicAttribute{
 				Description: "Additional free-form key-value pairs merged into the model_info object sent to the LiteLLM API. Values retain their native types (boolean, number, string, list).",
 				Optional:    true,
 				Computed:    true,
-				ElementType: types.DynamicType,
 			},
 		},
 	}
@@ -287,7 +291,7 @@ func (r *ModelResource) Create(ctx context.Context, req resource.CreateRequest, 
 
 	// Read back to ensure consistency
 	if err := r.readModelWithRetry(ctx, &data, 8); err != nil {
-		finalizeModelComputedDefaults(&data)
+		finalizeModelComputedDefaults(ctx, &data)
 		resp.Diagnostics.AddWarning("Read Error", fmt.Sprintf("Model created but failed to read back: %s", err))
 	}
 
@@ -342,7 +346,7 @@ func (r *ModelResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	}
 
 	if err := r.readModel(ctx, &data); err != nil {
-		finalizeModelComputedDefaults(&data)
+		finalizeModelComputedDefaults(ctx, &data)
 		resp.Diagnostics.AddWarning("Read Error", fmt.Sprintf("Model updated but failed to read back: %s", err))
 	}
 
@@ -506,12 +510,8 @@ func (r *ModelResource) createOrUpdateModel(ctx context.Context, data *ModelReso
 	// Add additional_model_info to the request.
 	// Unlike additional_litellm_params, values retain their native types
 	// (bool, number, array) and are sent as-is to the API.
-	if !data.AdditionalModelInfo.IsNull() && !data.AdditionalModelInfo.IsUnknown() {
-		for key, elem := range data.AdditionalModelInfo.Elements() {
-			if v := dynamicAttrToGo(ctx, elem); v != nil {
-				modelInfo[key] = v
-			}
-		}
+	for key, v := range additionalModelInfoToGo(ctx, data.AdditionalModelInfo) {
+		modelInfo[key] = v
 	}
 
 	modelReq := map[string]interface{}{
@@ -757,8 +757,12 @@ func (r *ModelResource) readModel(ctx context.Context, data *ModelResourceModel)
 		filterMIByState := !data.AdditionalModelInfo.IsNull() && !data.AdditionalModelInfo.IsUnknown()
 		stateMIKeys := make(map[string]struct{})
 		if filterMIByState {
-			for k := range data.AdditionalModelInfo.Elements() {
-				stateMIKeys[k] = struct{}{}
+			// State carries the dynamic as an object; its attribute names are
+			// the keys the user configured.
+			if obj, ok := data.AdditionalModelInfo.UnderlyingValue().(types.Object); ok {
+				for k := range obj.Attributes() {
+					stateMIKeys[k] = struct{}{}
+				}
 			}
 		}
 
@@ -778,15 +782,18 @@ func (r *ModelResource) readModel(ctx context.Context, data *ModelResourceModel)
 				}
 			}
 			if dv, ok := interfaceToDynamicValue(ctx, rawValue); ok {
-				additionalMI[key] = dv
+				// Store concrete values (Bool/Number/List/...) as object
+				// attributes, not Dynamic wrappers, so each key keeps a
+				// stable type across plan/read.
+				additionalMI[key] = dv.(types.Dynamic).UnderlyingValue()
 			}
 		}
-		data.AdditionalModelInfo, _ = types.MapValue(types.DynamicType, additionalMI)
+		data.AdditionalModelInfo = dynamicObjectValue(ctx, additionalMI)
 	} else {
 		if data.AccessGroups.IsUnknown() {
 			data.AccessGroups, _ = types.ListValue(types.StringType, []attr.Value{})
 		}
-		data.AdditionalModelInfo, _ = types.MapValue(types.DynamicType, map[string]attr.Value{})
+		data.AdditionalModelInfo = dynamicObjectValue(ctx, nil)
 	}
 
 	// Ensure mode is never Unknown after a Read. Terraform requires all
@@ -801,7 +808,7 @@ func (r *ModelResource) readModel(ctx context.Context, data *ModelResourceModel)
 	return nil
 }
 
-func finalizeModelComputedDefaults(data *ModelResourceModel) {
+func finalizeModelComputedDefaults(ctx context.Context, data *ModelResourceModel) {
 	if data.Mode.IsUnknown() {
 		data.Mode = types.StringNull()
 	}
@@ -812,7 +819,9 @@ func finalizeModelComputedDefaults(data *ModelResourceModel) {
 		data.AdditionalLiteLLMParams, _ = types.MapValue(types.StringType, map[string]attr.Value{})
 	}
 	if data.AdditionalModelInfo.IsUnknown() {
-		data.AdditionalModelInfo, _ = types.MapValue(types.DynamicType, map[string]attr.Value{})
+		// Empty object, not null: keeps "unconfigured" distinguishable from
+		// Import (null/unknown) so Read does not absorb API-side keys.
+		data.AdditionalModelInfo = dynamicObjectValue(ctx, nil)
 	}
 }
 
@@ -984,12 +993,8 @@ func (r *ModelResource) patchModel(ctx context.Context, data *ModelResourceModel
 	}
 
 	// Add additional_model_info to the request (same merge as createOrUpdateModel).
-	if !data.AdditionalModelInfo.IsNull() && !data.AdditionalModelInfo.IsUnknown() {
-		for key, elem := range data.AdditionalModelInfo.Elements() {
-			if v := dynamicAttrToGo(ctx, elem); v != nil {
-				modelInfo[key] = v
-			}
-		}
+	for key, v := range additionalModelInfoToGo(ctx, data.AdditionalModelInfo) {
+		modelInfo[key] = v
 	}
 
 	// Build the PATCH request body
@@ -1059,6 +1064,43 @@ func convertStringValue(s string) interface{} {
 		}
 	}
 	return s
+}
+
+// additionalModelInfoToGo unwraps the Dynamic-carried object into a Go map
+// for merging into the model_info request body. Values keep their native
+// types (bool, number, list) via dynamicAttrToGo.
+func additionalModelInfoToGo(ctx context.Context, d types.Dynamic) map[string]interface{} {
+	if d.IsNull() || d.IsUnknown() {
+		return nil
+	}
+	obj, ok := d.UnderlyingValue().(types.Object)
+	if !ok {
+		return nil
+	}
+	result := make(map[string]interface{}, len(obj.Attributes()))
+	for key, elem := range obj.Attributes() {
+		if v := dynamicAttrToGo(ctx, elem); v != nil {
+			result[key] = v
+		}
+	}
+	return result
+}
+
+// dynamicObjectValue assembles a Dynamic-wrapped Object from the given
+// key/values, deriving per-key attribute types from the values themselves.
+// An empty (or nil) map yields an empty object — not null — so that
+// "unconfigured" stays distinguishable from Import (null/unknown) and Read
+// does not absorb API-side model_info keys into an unconfigured attribute.
+func dynamicObjectValue(ctx context.Context, elems map[string]attr.Value) types.Dynamic {
+	attrTypes := make(map[string]attr.Type, len(elems))
+	for k, v := range elems {
+		attrTypes[k] = v.Type(ctx)
+	}
+	obj, diags := types.ObjectValue(attrTypes, elems)
+	if diags.HasError() {
+		return types.DynamicNull()
+	}
+	return types.DynamicValue(obj)
 }
 
 // dynamicAttrToGo converts a types.Dynamic (or concrete attr.Value) to a Go
